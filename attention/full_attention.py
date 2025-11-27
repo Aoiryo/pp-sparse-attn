@@ -68,7 +68,7 @@ def _full_attention_forward_kernel(
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)  # sum of exp
 
     # Scale factor for attention
-    scale = 1.0 / tl.sqrt(float(head_dim))
+    scale = 1.0 / tl.sqrt(head_dim * 1.0)
 
     # Iterate over all key blocks (this is the O(N^2) loop)
     for start_n in range(0, seq_len, BLOCK_N):
@@ -112,10 +112,62 @@ def _full_attention_forward_kernel(
     tl.store(o_ptrs, acc.to(Out.dtype.element_ty), mask=offs_m[:, None] < seq_len)
 
 
+class _FullAttentionFunction(torch.autograd.Function):
+    """
+    Autograd function wrapper for full attention Triton kernel.
+    """
+
+    @staticmethod
+    def forward(ctx, q, k, v):
+        batch_size, num_heads, seq_len, head_dim = q.shape
+        out = torch.empty_like(q)
+
+        BLOCK_M = 64
+        BLOCK_N = 64
+        BLOCK_DMODEL = head_dim
+        grid = (triton.cdiv(seq_len, BLOCK_M), batch_size * num_heads)
+
+        _full_attention_forward_kernel[grid](
+            q, k, v, out,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+            out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+            batch_size, num_heads, seq_len, head_dim,
+            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_DMODEL=BLOCK_DMODEL,
+        )
+
+        ctx.save_for_backward(q, k, v)
+        ctx.head_dim = head_dim
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Backward using PyTorch autograd fallback."""
+        q, k, v = ctx.saved_tensors
+        head_dim = ctx.head_dim
+
+        # Enable gradients for inputs
+        with torch.enable_grad():
+            q_temp = q.detach().requires_grad_(True)
+            k_temp = k.detach().requires_grad_(True)
+            v_temp = v.detach().requires_grad_(True)
+
+            # Recompute forward pass
+            scale = 1.0 / (head_dim ** 0.5)
+            attn_scores = torch.matmul(q_temp, k_temp.transpose(-2, -1)) * scale
+            attn_weights = torch.softmax(attn_scores, dim=-1)
+            out_temp = torch.matmul(attn_weights, v_temp)
+
+            # Compute gradients
+            torch.autograd.backward(out_temp, grad_output)
+
+        return q_temp.grad, k_temp.grad, v_temp.grad
+
+
 def full_attention_forward(q, k, v):
     """
-    Full attention forward pass using Triton kernel.
-    Now it is simply self-attention. 
+    Full attention forward pass using Triton kernel with autograd support.
 
     Args:
         q: Query tensor [batch, num_heads, seq_len, head_dim]
@@ -125,32 +177,7 @@ def full_attention_forward(q, k, v):
     Returns:
         out: Output tensor [batch, num_heads, seq_len, head_dim]
     """
-    batch_size, num_heads, seq_len, head_dim = q.shape
-    assert k.shape == v.shape == q.shape, "Q, K, V must have the same shape"
-
-    # Allocate output
-    out = torch.empty_like(q)
-
-    # Launch parameters
-    BLOCK_M = 64 # num of queries per node
-    BLOCK_N = 64 # num of keys
-    BLOCK_DMODEL = head_dim
-
-    # Grid dimensions: (num_query_blocks, batch * num_heads)
-    grid = (triton.cdiv(seq_len, BLOCK_M), batch_size * num_heads)
-
-    # Launch kernel
-    _full_attention_forward_kernel[grid](
-        q, k, v, out,
-        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-        out.stride(0), out.stride(1), out.stride(2), out.stride(3),
-        batch_size, num_heads, seq_len, head_dim,
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_DMODEL=BLOCK_DMODEL,
-    )
-
-    return out
+    return _FullAttentionFunction.apply(q, k, v)
 
 
 class FullAttention(torch.nn.Module):
