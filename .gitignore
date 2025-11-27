@@ -37,6 +37,7 @@ wheels/
 
 # Triton cache
 ~/.triton/
+triton/
 
 # PyTorch
 *.pth
