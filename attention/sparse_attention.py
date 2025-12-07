@@ -228,10 +228,12 @@ def _build_block_metadata(mask, block_m, block_n, prune_empty_blocks=True):
                     key_blocks, device=device, dtype=torch.int32
                 )
     else:
-        max_blocks_per_q = max(num_k_blocks, 1)
+        # No pruning: all query blocks attend to all key blocks
+        max_blocks_per_q = num_k_blocks
+        # Create indices: each row is [0, 1, 2, ..., num_k_blocks-1]
         block_indices = torch.arange(
             num_k_blocks, device=device, dtype=torch.int32
-        ).repeat(total_q_blocks, 1)
+        ).unsqueeze(0).repeat(total_q_blocks, 1)
         block_counts.fill_(num_k_blocks)
 
     return block_indices, block_counts, max_blocks_per_q, num_q_blocks
@@ -284,10 +286,10 @@ class _SparseAttentionFunction(torch.autograd.Function):
         # Allocate output
         out = torch.empty_like(q)
 
-        # Choose block sizes (same as full attention)
-        BLOCK_M = 64
-        BLOCK_N = 64
-        BLOCK_DMODEL = head_dim
+        # Choose block sizes adaptively based on GPU capability
+        from attention.full_attention import _get_block_sizes
+        # BLOCK_M, BLOCK_N, BLOCK_DMODEL = _get_block_sizes(head_dim, q.device)
+        BLOCK_M, BLOCK_N, BLOCK_DMODEL = 32, 32, head_dim
 
         # Build block metadata on the fly if not provided
         if block_indices is None or block_counts is None:
