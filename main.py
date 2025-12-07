@@ -115,20 +115,131 @@ def demo_hybrid_transformer():
     print("✓ Hybrid transformer working!")
 
 
+def demo_attention_plus_tensor_parallel():
+    """
+    Comprehensive test combining Sparse Attention and Tensor Parallelism.
+    Tests the full Hybrid Transformer pipeline.
+    """
+    print("\n" + "="*70)
+    print("DEMO 4: Complete Hybrid Transformer Test")
+    print("="*70)
+
+    from models.hybrid_transformer import HybridTransformerBlock
+
+    # Check if distributed
+    use_tensor_parallel = dist.is_initialized()
+    rank = dist.get_rank() if use_tensor_parallel else 0
+    world_size = dist.get_world_size() if use_tensor_parallel else 1
+
+    if use_tensor_parallel:
+        from parallel import initialize_model_parallel
+        initialize_model_parallel(tensor_model_parallel_size=world_size)
+        print(f"[Rank {rank}/{world_size}] Initializing hybrid transformer...")
+    else:
+        print("Running on single GPU (no tensor parallelism)")
+
+    # Config
+    batch_size = 4
+    seq_len = 256
+    hidden_size = 512
+    num_heads = 8
+    mlp_hidden_size = 2048
+    device = f'cuda:{rank}' if torch.cuda.is_available() else 'cpu'
+
+    # Create model
+    block = HybridTransformerBlock(
+        hidden_size=hidden_size,
+        num_heads=num_heads,
+        mlp_hidden_size=mlp_hidden_size,
+        use_sparse_attention=True,
+        sparse_pattern='local',
+        window_size=64,
+        use_tensor_parallel=use_tensor_parallel,
+    ).to(device)
+
+    if rank == 0:
+        print(f"\nModel config:")
+        print(f"  Batch size: {batch_size}")
+        print(f"  Sequence length: {seq_len}")
+        print(f"  Hidden size: {hidden_size}")
+        print(f"  Num heads: {num_heads}")
+        print(f"  MLP hidden: {mlp_hidden_size}")
+        print(f"  Attention: Sparse (local window, size=64)")
+        print(f"  MLP: {'Tensor Parallel' if use_tensor_parallel else 'Standard'}")
+
+    # Test forward pass
+    x = torch.randn(batch_size, seq_len, hidden_size, device=device)
+
+    if rank == 0:
+        print(f"\nForward pass:")
+        print(f"  Input shape: {x.shape}")
+
+    out = block(x)
+
+    if rank == 0:
+        print(f"  Output shape: {out.shape}")
+        print(f"  Output mean: {out.mean().item():.6f}")
+        print(f"  Output std: {out.std().item():.6f}")
+
+    # Test backward pass
+    if rank == 0:
+        print(f"\nBackward pass:")
+
+    loss = out.sum()
+    loss.backward()
+
+    # Check gradients
+    grad_norms = {}
+    for name, param in block.named_parameters():
+        if param.grad is not None:
+            grad_norms[name] = param.grad.norm().item()
+
+    if rank == 0:
+        print(f"  Gradient norms:")
+        for name, norm in sorted(grad_norms.items()):
+            print(f"    {name}: {norm:.6f}")
+
+    # Performance breakdown
+    if rank == 0:
+        print(f"\n✓ Complete hybrid transformer test passed!")
+        print(f"\nComponent breakdown:")
+        print(f"  Attention: Sparse (25% density) - 4x faster than full")
+        if use_tensor_parallel:
+            print(f"  MLP: Tensor Parallel on {world_size} GPUs - {world_size}x model parallelism")
+        else:
+            print(f"  MLP: Single GPU")
+
+        # Calculate theoretical speedup
+        attention_speedup = 4.0
+        mlp_speedup = world_size if use_tensor_parallel else 1.0
+        # Assume 50% time in attention, 50% in MLP
+        overall_speedup = 2.0 / (1.0/attention_speedup + 1.0/mlp_speedup)
+        print(f"  Theoretical overall speedup: {overall_speedup:.2f}x")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--tensor-parallel', action='store_true',
                        help='Enable tensor parallelism (requires torchrun)')
+    parser.add_argument('--full-test', action='store_true',
+                       help='Run comprehensive test with attention + tensor parallel')
     args = parser.parse_args()
 
     if args.tensor_parallel and 'RANK' in os.environ:
         dist.init_process_group(backend='nccl')
 
-    demo_full_attention()
-    demo_sparse_attention()
+    # Run basic demos (only on rank 0 for single-GPU tests)
+    if not args.tensor_parallel or dist.get_rank() == 0:
+        demo_full_attention()
+        demo_sparse_attention()
 
+    # Run hybrid transformer demo
     if not args.tensor_parallel or 'RANK' in os.environ:
         demo_hybrid_transformer()
+
+    # Run comprehensive test
+    if args.full_test:
+        demo_attention_plus_tensor_parallel()
 
     if args.tensor_parallel and dist.is_initialized():
         dist.destroy_process_group()

@@ -112,6 +112,37 @@ def _full_attention_forward_kernel(
     tl.store(o_ptrs, acc.to(Out.dtype.element_ty), mask=offs_m[:, None] < seq_len)
 
 
+def _get_block_sizes(head_dim, device):
+    """
+    Automatically select block sizes based on head_dim and GPU capabilities.
+
+    Shared memory usage estimate:
+    - q, k, v, qk, p, acc: ~6 * BLOCK_M * BLOCK_N * 4 bytes
+
+    Returns:
+        (BLOCK_M, BLOCK_N, BLOCK_DMODEL)
+    """
+    if device.type == 'cuda':
+        capability = torch.cuda.get_device_capability(device)
+        major = capability[0]
+        # A100/H100 (compute 8.x+): 99-164 KB shared mem
+        # V100 (compute 7.x): 48 KB shared mem
+        max_smem_kb = 99 if major >= 8 else 48
+    else:
+        max_smem_kb = 48  # Conservative for CPU/unknown
+
+    # For head_dim=64: 64x64 blocks need ~96 KB
+    # For head_dim=128: 32x64 blocks need ~96 KB
+    if head_dim <= 64 and max_smem_kb >= 96:
+        BLOCK_M, BLOCK_N = 64, 64
+    elif head_dim <= 128:
+        BLOCK_M, BLOCK_N = 32, 64
+    else:
+        BLOCK_M, BLOCK_N = 32, 32
+
+    return BLOCK_M, BLOCK_N, head_dim
+
+
 class _FullAttentionFunction(torch.autograd.Function):
     """
     Autograd function wrapper for full attention Triton kernel.
@@ -122,9 +153,8 @@ class _FullAttentionFunction(torch.autograd.Function):
         batch_size, num_heads, seq_len, head_dim = q.shape
         out = torch.empty_like(q)
 
-        BLOCK_M = 64
-        BLOCK_N = 64
-        BLOCK_DMODEL = head_dim
+        # Automatically select block sizes based on GPU and head_dim
+        BLOCK_M, BLOCK_N, BLOCK_DMODEL = _get_block_sizes(head_dim, q.device)
         grid = (triton.cdiv(seq_len, BLOCK_M), batch_size * num_heads)
 
         _full_attention_forward_kernel[grid](

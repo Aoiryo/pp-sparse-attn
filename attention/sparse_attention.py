@@ -284,10 +284,9 @@ class _SparseAttentionFunction(torch.autograd.Function):
         # Allocate output
         out = torch.empty_like(q)
 
-        # Choose block sizes (same as full attention)
-        BLOCK_M = 64
-        BLOCK_N = 64
-        BLOCK_DMODEL = head_dim
+        # Choose block sizes adaptively based on GPU capability
+        from attention.full_attention import _get_block_sizes
+        BLOCK_M, BLOCK_N, BLOCK_DMODEL = _get_block_sizes(head_dim, q.device)
 
         # Build block metadata on the fly if not provided
         if block_indices is None or block_counts is None:
