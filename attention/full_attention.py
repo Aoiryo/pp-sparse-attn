@@ -154,7 +154,8 @@ class _FullAttentionFunction(torch.autograd.Function):
         out = torch.empty_like(q)
 
         # Automatically select block sizes based on GPU and head_dim
-        BLOCK_M, BLOCK_N, BLOCK_DMODEL = _get_block_sizes(head_dim, q.device)
+        # BLOCK_M, BLOCK_N, BLOCK_DMODEL = _get_block_sizes(head_dim, q.device)
+        BLOCK_M, BLOCK_N, BLOCK_DMODEL = 32, 32, head_dim
         grid = (triton.cdiv(seq_len, BLOCK_M), batch_size * num_heads)
 
         _full_attention_forward_kernel[grid](
