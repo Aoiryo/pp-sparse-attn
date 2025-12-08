@@ -4,6 +4,7 @@ Tests for tensor parallel layers.
 Note: These tests require running with torchrun to simulate multi-GPU environment.
 
 Run with:
+    export PYTHONPATH="/home/zhuominc/leo/pp-sparse-attn":$PYTHONPATH
     torchrun --nproc_per_node=4 tests/test_parallel.py
 """
 

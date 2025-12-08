@@ -6,7 +6,8 @@ Tests:
 2. Sparse attention correctness (once implemented)
 3. Numerical stability tests
 """
-
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "9"
 import time
 from contextlib import contextmanager
 
@@ -285,9 +286,9 @@ def test_sparse_attention_perf_compare():
 
     # Precompute metadata to exclude CPU-side building from timing
     block_indices_dense, block_counts_dense, max_blocks_per_q_dense, num_q_blocks_dense = \
-        _build_block_metadata(mask, block_m=32, block_n=32, prune_empty_blocks=False)
+        _build_block_metadata(mask, block_m=64, block_n=64, prune_empty_blocks=False)
     block_indices_pruned, block_counts_pruned, max_blocks_per_q_pruned, num_q_blocks_pruned = \
-        _build_block_metadata(mask, block_m=32, block_n=32, prune_empty_blocks=True)
+        _build_block_metadata(mask, block_m=64, block_n=64, prune_empty_blocks=True)
     _sync()
 
     # Warmup to exclude compilation from timing
