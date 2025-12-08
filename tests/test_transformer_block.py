@@ -8,7 +8,7 @@ Benchmark a parallel Transformer block that combines:
 Run with:
     torchrun --nproc_per_node=4 tests/test_transformer_block.py --batch-size 8 --seq-len 1024 --hidden-size 1024 --num-heads 16
 
-Then repeat with nproc_per_node = 1,2,4,8 and compare forward times.
+Then repeat with nproc_per_node = 1,2,4,8 and compare forward times. 
 """
 
 import os
