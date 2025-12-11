@@ -78,7 +78,12 @@ class ParallelSelfAttention(nn.Module):
     - Output projection: RowParallelLinear(hidden, hidden, input_is_parallel=True)
     """
 
-    def __init__(self, hidden_size: int, num_heads: int, dropout_p: float = 0.0, mask: torch.Tensor = None):
+    def __init__(self, hidden_size: int, num_heads: int, dropout_p: float = 0.0, mask: torch.Tensor = None, 
+                 prune_empty_blocks: bool = False,
+                 block_indices: torch.Tensor = None,
+                 block_counts: torch.Tensor = None,
+                 max_blocks_per_q: int = None,
+                 num_q_blocks: int = None,):
         super().__init__()
         assert hidden_size % num_heads == 0, \
             "hidden_size must be divisible by num_heads"
@@ -92,6 +97,12 @@ class ParallelSelfAttention(nn.Module):
             "num_heads must be divisible by tensor_model_parallel_world_size"
         self.world_size = world_size
         self.num_heads_per_partition = num_heads // world_size
+        
+        self.prune_empty_blocks = prune_empty_blocks
+        self.block_indices = block_indices
+        self.block_counts = block_counts
+        self.max_blocks_per_q = max_blocks_per_q
+        self.num_q_blocks = num_q_blocks
         
         self.mask = mask
         # QKV projection (sharded on output features)
@@ -147,7 +158,12 @@ class ParallelSelfAttention(nn.Module):
         # NOTE: full_attention_forward does scaling + softmax internally
         # context = full_attention_forward(q, k, v)
                
-        context = sparse_attention_forward(q, k, v, self.mask)
+        context = sparse_attention_forward(q, k, v, self.mask, 
+                                          prune_empty_blocks=self.prune_empty_blocks,
+                                          block_indices=self.block_indices,
+                                          block_counts=self.block_counts,
+                                          max_blocks_per_q=self.max_blocks_per_q,
+                                          num_q_blocks=self.num_q_blocks,)
 
         # 4) Merge heads back to sharded hidden dimension
         #    context: [B, L, H_local * D_head] = [B, L, local_hidden]
@@ -229,6 +245,11 @@ class ParallelTransformerBlock(nn.Module):
         mlp_hidden_size: int,
         dropout_p: float = 0.0,
         mask: torch.Tensor = None,
+        prune_empty_blocks: bool = False,
+        block_indices: torch.Tensor = None,
+        block_counts: torch.Tensor = None,
+        max_blocks_per_q: int = None,
+        num_q_blocks: int = None,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -239,6 +260,11 @@ class ParallelTransformerBlock(nn.Module):
             num_heads=num_heads,
             dropout_p=dropout_p,
             mask=mask,
+            prune_empty_blocks=False,
+            block_indices=block_indices,
+            block_counts=block_counts,
+            max_blocks_per_q=max_blocks_per_q,
+            num_q_blocks=num_q_blocks,
         )
         self.ln2 = nn.LayerNorm(hidden_size)
         self.mlp = ParallelFeedForward(
@@ -270,6 +296,66 @@ class ParallelTransformerBlock(nn.Module):
 # ---------------------------------------------------------------------------
 # Benchmark
 # ---------------------------------------------------------------------------
+def _build_block_metadata(mask, block_m, block_n, prune_empty_blocks=True):
+    """
+    Build block-sparse metadata from a dense mask.
+
+    Returns:
+        block_indices: [total_q_blocks, max_blocks_per_q] int32 key block ids
+        block_counts: [total_q_blocks] int32 number of valid key blocks per q block
+        max_blocks_per_q: int
+        num_q_blocks: int
+    """
+    batch_size, num_heads, seq_len, _ = mask.shape
+    num_q_blocks = (seq_len + block_m - 1) // block_m
+    num_k_blocks = (seq_len + block_n - 1) // block_n
+    total_q_blocks = batch_size * num_heads * num_q_blocks
+    device = mask.device
+
+    block_counts = torch.zeros(total_q_blocks, device=device, dtype=torch.int32)
+
+    if prune_empty_blocks:
+        block_lists = []
+        max_blocks_per_q = 0
+        idx = 0
+        for b in range(batch_size):
+            for h in range(num_heads):
+                for qb in range(num_q_blocks):
+                    q_start = qb * block_m
+                    q_end = min((qb + 1) * block_m, seq_len)
+                    key_blocks = []
+                    for kb in range(num_k_blocks):
+                        k_start = kb * block_n
+                        k_end = min((kb + 1) * block_n, seq_len)
+                        if mask[b, h, q_start:q_end, k_start:k_end].any():
+                            key_blocks.append(kb)
+                    block_counts[idx] = len(key_blocks)
+                    max_blocks_per_q = max(max_blocks_per_q, len(key_blocks))
+                    block_lists.append(key_blocks)
+                    idx += 1
+
+        if max_blocks_per_q == 0:
+            max_blocks_per_q = 1  # avoid zero-sized tensors
+
+        block_indices = torch.zeros(
+            (total_q_blocks, max_blocks_per_q), device=device, dtype=torch.int32
+        )
+        for i, key_blocks in enumerate(block_lists):
+            if key_blocks:
+                block_indices[i, :len(key_blocks)] = torch.tensor(
+                    key_blocks, device=device, dtype=torch.int32
+                )
+    else:
+        # No pruning: all query blocks attend to all key blocks
+        max_blocks_per_q = num_k_blocks
+        # Create indices: each row is [0, 1, 2, ..., num_k_blocks-1]
+        block_indices = torch.arange(
+            num_k_blocks, device=device, dtype=torch.int32
+        ).unsqueeze(0).repeat(total_q_blocks, 1)
+        block_counts.fill_(num_k_blocks)
+
+    return block_indices, block_counts, max_blocks_per_q, num_q_blocks
+
 
 def benchmark_block(
     batch_size: int,
@@ -302,6 +388,17 @@ def benchmark_block(
         start = max(0, i - window_size // 2)
         end = min(seq_len, i + window_size // 2)
         mask[:, :, i, start:end] = True
+        
+    def _sync():
+        if device.startswith('cuda'):
+            torch.cuda.synchronize()
+
+    # Precompute metadata to exclude CPU-side building from timing
+    block_indices_dense, block_counts_dense, max_blocks_per_q_dense, num_q_blocks_dense = \
+        _build_block_metadata(mask, block_m=64, block_n=64, prune_empty_blocks=False)
+    block_indices_pruned, block_counts_pruned, max_blocks_per_q_pruned, num_q_blocks_pruned = \
+        _build_block_metadata(mask, block_m=64, block_n=64, prune_empty_blocks=True)
+    _sync()
 
     block = ParallelTransformerBlock(
         hidden_size=hidden_size,
@@ -309,6 +406,11 @@ def benchmark_block(
         mlp_hidden_size=mlp_hidden_size,
         dropout_p=0.0,  # disable dropout for clean timing
         mask=mask,
+        prune_empty_blocks=False,
+        block_indices=block_indices_dense,
+        block_counts=block_counts_dense,
+        max_blocks_per_q=max_blocks_per_q_dense,
+        num_q_blocks=num_q_blocks_dense,        
     ).to(device)
     block.eval()
 
