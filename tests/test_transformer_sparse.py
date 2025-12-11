@@ -146,7 +146,7 @@ class ParallelSelfAttention(nn.Module):
         # NOTE: full_attention_forward does scaling + softmax internally
         # context = full_attention_forward(q, k, v)
 
-        mask = torch.zeros(bsz, self.num_heads, seq_len, seq_len, dtype=torch.bool, device=q.device)
+        mask = torch.zeros(bsz, self.num_heads_per_partition, seq_len, seq_len, dtype=torch.bool, device=q.device)
         window_size = 32
         for i in range(seq_len):
             start = max(0, i - window_size // 2)
