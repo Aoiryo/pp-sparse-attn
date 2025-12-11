@@ -296,7 +296,7 @@ def benchmark_block(
         )
 
     # Build block
-    mask = torch.zeros(batch_size, num_heads // world_size, seq_len, seq_len, dtype=torch.bool, device="cpu")
+    mask = torch.zeros(batch_size, num_heads // world_size, seq_len, seq_len, dtype=torch.bool, device=device)
     window_size = 32
     for i in range(seq_len):
         start = max(0, i - window_size // 2)
