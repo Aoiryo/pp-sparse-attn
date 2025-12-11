@@ -406,11 +406,11 @@ def benchmark_block(
         mlp_hidden_size=mlp_hidden_size,
         dropout_p=0.0,  # disable dropout for clean timing
         mask=mask,
-        prune_empty_blocks=False,
-        block_indices=block_indices_dense,
-        block_counts=block_counts_dense,
-        max_blocks_per_q=max_blocks_per_q_dense,
-        num_q_blocks=num_q_blocks_dense,        
+        prune_empty_blocks=True,
+        block_indices=block_indices_pruned,
+        block_counts=block_counts_pruned,
+        max_blocks_per_q=max_blocks_per_q_pruned,
+        num_q_blocks=num_q_blocks_pruned,        
     ).to(device)
     block.eval()
 
