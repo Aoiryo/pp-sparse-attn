@@ -78,7 +78,7 @@ class ParallelSelfAttention(nn.Module):
     - Output projection: RowParallelLinear(hidden, hidden, input_is_parallel=True)
     """
 
-    def __init__(self, hidden_size: int, num_heads: int, dropout_p: float = 0.0):
+    def __init__(self, hidden_size: int, num_heads: int, dropout_p: float = 0.0, mask: torch.Tensor = None):
         super().__init__()
         assert hidden_size % num_heads == 0, \
             "hidden_size must be divisible by num_heads"
@@ -92,7 +92,8 @@ class ParallelSelfAttention(nn.Module):
             "num_heads must be divisible by tensor_model_parallel_world_size"
         self.world_size = world_size
         self.num_heads_per_partition = num_heads // world_size
-
+        
+        self.mask = mask
         # QKV projection (sharded on output features)
         self.qkv = ColumnParallelLinear(
             hidden_size,
@@ -145,15 +146,8 @@ class ParallelSelfAttention(nn.Module):
         #    out:   [B, H_local, L, D_head]
         # NOTE: full_attention_forward does scaling + softmax internally
         # context = full_attention_forward(q, k, v)
-
-        mask = torch.zeros(bsz, self.num_heads_per_partition, seq_len, seq_len, dtype=torch.bool, device=q.device)
-        window_size = 32
-        for i in range(seq_len):
-            start = max(0, i - window_size // 2)
-            end = min(seq_len, i + window_size // 2)
-            mask[:, :, i, start:end] = True
                
-        context = sparse_attention_forward(q, k, v, mask)
+        context = sparse_attention_forward(q, k, v, self.mask)
 
         # 4) Merge heads back to sharded hidden dimension
         #    context: [B, L, H_local * D_head] = [B, L, local_hidden]
@@ -234,6 +228,7 @@ class ParallelTransformerBlock(nn.Module):
         num_heads: int,
         mlp_hidden_size: int,
         dropout_p: float = 0.0,
+        mask: torch.Tensor = None,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -243,6 +238,7 @@ class ParallelTransformerBlock(nn.Module):
             hidden_size=hidden_size,
             num_heads=num_heads,
             dropout_p=dropout_p,
+            mask=mask,
         )
         self.ln2 = nn.LayerNorm(hidden_size)
         self.mlp = ParallelFeedForward(
@@ -300,11 +296,19 @@ def benchmark_block(
         )
 
     # Build block
+    mask = torch.zeros(batch_size, num_heads // world_size, seq_len, seq_len, dtype=torch.bool, device="cpu")
+    window_size = 32
+    for i in range(seq_len):
+        start = max(0, i - window_size // 2)
+        end = min(seq_len, i + window_size // 2)
+        mask[:, :, i, start:end] = True
+
     block = ParallelTransformerBlock(
         hidden_size=hidden_size,
         num_heads=num_heads,
         mlp_hidden_size=mlp_hidden_size,
         dropout_p=0.0,  # disable dropout for clean timing
+        mask=mask,
     ).to(device)
     block.eval()
 
